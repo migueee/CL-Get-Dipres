@@ -82,9 +82,10 @@ ANIOS_RESPALDO = {
 
 RE_ANIO_HREF = re.compile(r"w3-multipropertyvalues-15199-(\d+)\.html")
 RE_CSV = re.compile(r"articles-(\d+)_doc_csv\.csv")
+# Tolerante a tildes mal decodificadas (p. ej. "EjecuciÃ³n", "DÃ³lares").
 RE_ENCABEZADO = re.compile(
-    r"Informe\s+Ejecuci[oó]n\s+(?:Acumulada\s+)?(?:a\s+)?(?P<periodo>.+?)\s*"
-    r"\[(?P<moneda>Pesos|D[oó]lares)\]",
+    r"Informe\s+Ejecuci.{1,3}n\s+(?:Acumulada\s+)?(?:a\s+)?(?P<periodo>.+?)\s*"
+    r"\[(?P<moneda>Pesos|D.{1,3}lares)\]",
     re.IGNORECASE,
 )
 RE_ENTERO = re.compile(r"-?\d+")
@@ -169,9 +170,14 @@ class Enlace:
 
 def nueva_sesion() -> requests.Session:
     s = requests.Session()
-    s.headers["User-Agent"] = (
-        "Mozilla/5.0 (compatible; transparencia-fiscal-etl/1.0)"
-    )
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-CL,es;q=0.9,en;q=0.5",
+    })
     retry = Retry(
         total=4, backoff_factor=1.5,
         status_forcelist=(429, 500, 502, 503, 504), allowed_methods=("GET",),
@@ -187,10 +193,40 @@ def obtener(sesion: requests.Session, url: str) -> requests.Response:
     return resp
 
 
+def obtener_html(sesion: requests.Session, url: str) -> str:
+    """Descarga una pagina HTML decodificandola como UTF-8 (el sitio la declara
+    en un <meta>, y requests a veces asume ISO-8859-1 y rompe las tildes)."""
+    resp = obtener(sesion, url)
+    try:
+        return resp.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return resp.content.decode("cp1252", errors="replace")
+
+
+def diagnosticar(html: str, anio: int, seccion: str, cache: Path) -> None:
+    """Cuando no se encuentran enlaces: guarda el HTML y resume lo que contiene."""
+    cache.mkdir(parents=True, exist_ok=True)
+    ruta = cache / f"debug_{anio}_{seccion}.html"
+    ruta.write_text(html, encoding="utf-8")
+    log.warning("   DIAGNOSTICO: HTML guardado en %s (%d caracteres)", ruta, len(html))
+    log.warning("   apariciones: '.csv'=%d  'doc_csv'=%d  'Informe Ejec'=%d  "
+                "'[Pesos]'=%d  'Cargando'=%d",
+                html.count(".csv"), html.count("doc_csv"),
+                len(re.findall(r"Informe\s+Ejecuci", html)),
+                html.count("[Pesos]"), html.count("Cargando"))
+    for m in list(re.finditer(r"doc_csv|\.csv", html))[:2]:
+        ini = max(0, m.start() - 160)
+        log.warning("   contexto: ...%s...", html[ini:m.end() + 60].replace("\n", " "))
+    if "csv" not in html.lower():
+        log.warning("   La pagina no trae enlaces CSV en el HTML inicial; "
+                    "probablemente se cargan por JavaScript. Comparte este "
+                    "diagnostico para ajustar el script.")
+
+
 def descubrir_anios(sesion: requests.Session) -> dict[int, int]:
     """Lee el selector 'Ver otros anios' para mapear anio -> id de pagina."""
     try:
-        soup = BeautifulSoup(obtener(sesion, SEMILLA).text, "html.parser")
+        soup = BeautifulSoup(obtener_html(sesion, SEMILLA), "html.parser")
         ids = {}
         for a in soup.find_all("a", href=True):
             m = RE_ANIO_HREF.search(a["href"])
@@ -507,7 +543,7 @@ def main(argv=None) -> int:
             pagina = url_pagina(seccion, ids_anio[anio])
             log.info("== %s / %s", anio, seccion)
             try:
-                html = obtener(sesion, pagina).text
+                html = obtener_html(sesion, pagina)
             except requests.RequestException as exc:
                 log.warning("   no se pudo abrir %s (%s)", pagina, exc)
                 continue
@@ -516,6 +552,7 @@ def main(argv=None) -> int:
                 enlaces = [x for x in enlaces if x.moneda == args.moneda]
             if not enlaces:
                 log.warning("   sin enlaces CSV en el HTML estatico de %s", pagina)
+                diagnosticar(html, anio, seccion, cache)
                 continue
             for e in enlaces:
                 try:
