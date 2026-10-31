@@ -44,12 +44,21 @@ si ya fue cargado con la misma marca `ts`. Si DIPRES republica un informe, se re
 
 Colecciones en la base `transparencia_fiscal`:
 
-- `ejecucion`: una fila del CSV por documento, con `anio`, `seccion`, `periodo`, `mes_cierre`,
-  `moneda`, `partida`, `capitulo`, `programa`, `subtitulo`, `item`, `asignacion`, `denominacion`,
+- `ejecucion`: una fila del CSV por documento, con `anio`, `seccion`, `periodo` (etiqueta de
+  DIPRES), `mes` (mes de cierre, 1-12), `tipo_informe` (`mensual` | `trimestral`), `moneda`,
+  `partida`, `capitulo`, `programa`, `subtitulo`, `item`, `asignacion`, `denominacion`,
   `presupuesto_inicial`, `presupuesto_vigente`, `ejecucion_acumulada`, `nivel`, `archivo_id`.
-- `cargas`: registro de cada archivo cargado (url, `ts`, sha256, filas).
+- `cargas`: registro de cada archivo cargado (url, `ts`, sha256, filas, `mes`, `tipo_informe`).
 
 Puntos a tener en cuenta:
+
+- **Los informes son acumulados** al mes de cierre. DIPRES publica meses sueltos (enero, febrero,
+  abril, mayo, julio, agosto…) y "trimestres", que son el acumulado a marzo, junio, septiembre y
+  diciembre. Los trimestrales **no se descartan**: son el informe de esos meses y se guardan con
+  `mes` = 3, 6, 9, 12. Así la serie mensual queda completa y los trimestres, semestres, etc. se
+  derivan restando acumulados (`flujo del mes = acum(m) - acum(m-1)`; `Q2 = acum(6) - acum(3)`;
+  `S2 = acum(12) - acum(6)`).
+- Si existieran dos informes del mismo mes de cierre, se conserva el más reciente.
 
 - Las filas son **jerárquicas** (un subtítulo agrupa a sus ítems y un ítem a sus asignaciones).
   Para no duplicar montos, filtra por `nivel` (`subtitulo`, `item`, `asignacion`, `resultado`).

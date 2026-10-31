@@ -25,10 +25,18 @@ Notas sobre los datos
   asignaciones. Para no duplicar montos, filtra por el campo `nivel`
   ("subtitulo", "item", "asignacion", "resultado"). Ejemplo:
       db.ejecucion.aggregate([
-        {"$match": {"anio": 2026, "periodo": "Tercer Trimestre",
+        {"$match": {"anio": 2026, "mes": 9,
                     "moneda": "Pesos", "nivel": "subtitulo"}},
         {"$group": {"_id": "$subtitulo",
                     "ejecucion": {"$sum": "$ejecucion_acumulada"}}}])
+* Los informes son ACUMULADOS al mes de cierre (`mes`, 1-12). DIPRES publica
+  meses sueltos y "trimestres", que son el acumulado a marzo, junio, septiembre
+  y diciembre: no son un periodo distinto, sino el informe de esos meses
+  (por eso se guardan con `mes` = 3, 6, 9, 12 y `tipo_informe` = "trimestral").
+  Trimestres, semestres, etc. se derivan restando acumulados:
+      flujo del mes m  = acumulado(m) - acumulado(m-1)
+      Q1 = acum(3)   Q2 = acum(6) - acum(3)   Q3 = acum(9) - acum(6)
+      Q4 = acum(12) - acum(9)   S1 = acum(6)   S2 = acum(12) - acum(6)
 * Las filas "RESULTADO" vienen sin partida/capitulo/programa en el CSV; aqui se
   les asigna el programa de la fila inmediatamente anterior.
 * Algunos montos vienen en notacion cientifica (p. ej. 1,36187E+11), con
@@ -160,12 +168,17 @@ class Enlace:
     anio: int
     seccion: str
     periodo: str
-    mes_cierre: int | None
+    mes: int | None  # mes de cierre: los informes son acumulados al mes (1-12)
     moneda: str  # "Pesos" | "Dolares"
     documento: str
     article_id: int
     url: str
     ts: str
+
+    @property
+    def tipo_informe(self) -> str:
+        """DIPRES publica meses sueltos y 'trimestres' (= acumulado a mar/jun/sep/dic)."""
+        return "trimestral" if "trimestre" in sin_tildes(self.periodo) else "mensual"
 
 
 def nueva_sesion() -> requests.Session:
@@ -275,7 +288,7 @@ def extraer_enlaces(html: str, pagina: str, anio: int, seccion: str) -> list[Enl
             periodo, moneda = actual
             vistos[article_id] = Enlace(
                 anio=anio, seccion=seccion, periodo=periodo,
-                mes_cierre=mes_de_cierre(periodo), moneda=moneda,
+                mes=mes_de_cierre(periodo), moneda=moneda,
                 documento=documento, article_id=article_id, url=url, ts=ts,
             )
     return list(vistos.values())
@@ -336,7 +349,7 @@ def parsear_csv(texto: str, e: Enlace) -> tuple[list[dict], dict]:
 
     base = {
         "anio": e.anio, "seccion": e.seccion, "periodo": e.periodo,
-        "mes_cierre": e.mes_cierre, "moneda": e.moneda,
+        "mes": e.mes, "tipo_informe": e.tipo_informe, "moneda": e.moneda,
         "documento": e.documento, "archivo_id": e.article_id,
     }
     stats: Counter = Counter()
@@ -423,7 +436,7 @@ def conectar_mongo(uri: str, nombre_db: str):
 def asegurar_indices(db) -> None:
     col = db["ejecucion"]
     col.create_index("archivo_id")
-    col.create_index([("anio", 1), ("mes_cierre", 1), ("moneda", 1), ("nivel", 1)])
+    col.create_index([("anio", 1), ("mes", 1), ("moneda", 1), ("nivel", 1)])
     col.create_index([("partida", 1), ("capitulo", 1), ("programa", 1), ("subtitulo", 1)])
 
 
@@ -431,8 +444,30 @@ def ya_cargado(db, e: Enlace) -> bool:
     return db["cargas"].find_one({"_id": e.article_id, "ts": e.ts}) is not None
 
 
-def cargar(db, e: Enlace, filas: list[dict], sha256: str, stats: dict) -> None:
+def _num_ts(valor) -> int:
+    return int(valor) if str(valor).isdigit() else 0
+
+
+def cargar(db, e: Enlace, filas: list[dict], sha256: str, stats: dict) -> bool:
     col = db["ejecucion"]
+    # Una sola fuente por (anio, seccion, mes, moneda, documento): si hubiera dos
+    # informes del mismo mes de cierre (p. ej. uno mensual y otro trimestral),
+    # se conserva el mas reciente para no duplicar montos.
+    if e.mes is not None:
+        otros = list(db["cargas"].find({
+            "anio": e.anio, "seccion": e.seccion, "mes": e.mes,
+            "moneda": e.moneda, "documento": e.documento,
+            "_id": {"$ne": e.article_id},
+        }))
+        if any(_num_ts(o.get("ts")) > _num_ts(e.ts) for o in otros):
+            log.warning("   %s [%s]: ya hay un informe mas reciente para el mes %s; omito",
+                        e.periodo, e.moneda, e.mes)
+            return False
+        for o in otros:
+            log.warning("   reemplazo informe anterior del mes %s (%s, id %s)",
+                        e.mes, o.get("periodo"), o["_id"])
+            col.delete_many({"archivo_id": o["_id"]})
+            db["cargas"].delete_one({"_id": o["_id"]})
     col.delete_many({"archivo_id": e.article_id})  # recarga limpia del archivo
     for i in range(0, len(filas), 5000):
         col.insert_many(filas[i:i + 5000], ordered=False)
@@ -440,21 +475,43 @@ def cargar(db, e: Enlace, filas: list[dict], sha256: str, stats: dict) -> None:
         {"_id": e.article_id},
         {
             "_id": e.article_id, "anio": e.anio, "seccion": e.seccion,
-            "periodo": e.periodo, "moneda": e.moneda, "documento": e.documento,
+            "periodo": e.periodo, "mes": e.mes, "tipo_informe": e.tipo_informe,
+            "moneda": e.moneda, "documento": e.documento,
             "url": e.url, "ts": e.ts, "sha256": sha256, "filas": len(filas),
             "stats": stats, "cargado_en": dt.datetime.now(dt.timezone.utc),
         },
         upsert=True,
     )
+    return True
 
 
 # --------------------------------------------------------------------------
 # Orquestacion
 # --------------------------------------------------------------------------
+def informar_cobertura(enlaces: list[Enlace]) -> None:
+    """Muestra que meses de cierre hay por moneda y si la serie tiene huecos."""
+    por_moneda: dict[str, list[Enlace]] = {}
+    for x in enlaces:
+        por_moneda.setdefault(x.moneda, []).append(x)
+    for moneda, xs in por_moneda.items():
+        meses = sorted({x.mes for x in xs if x.mes})
+        if not meses:
+            continue
+        faltan = [m for m in range(1, meses[-1] + 1) if m not in meses]
+        repetidos = [m for m in meses if sum(1 for x in xs if x.mes == m) > 1]
+        log.info("   [%s] meses de cierre: %s | %s", moneda,
+                 ",".join(map(str, meses)),
+                 f"FALTAN {faltan}" if faltan else "serie completa hasta el mes %d" % meses[-1])
+        if repetidos:
+            log.warning("   [%s] hay mas de un informe para los meses %s "
+                        "(se conservara el mas reciente al cargar)", moneda, repetidos)
+
+
 def procesar_contenido(db, e: Enlace, raw: bytes, seco: bool) -> None:
     filas, stats = parsear_csv(decodificar(raw), e)
-    log.info("   %s %s [%s]: %d filas %s", e.anio, e.periodo, e.moneda,
-             len(filas), {k: v for k, v in stats.items() if k != "filas"})
+    log.info("   %s %s -> mes %s (%s) [%s]: %d filas %s", e.anio, e.periodo, e.mes,
+             e.tipo_informe, e.moneda, len(filas),
+             {k: v for k, v in stats.items() if k != "filas"})
     if not seco:
         cargar(db, e, filas, hashlib.sha256(raw).hexdigest(), stats)
 
@@ -516,7 +573,7 @@ def main(argv=None) -> int:
         m = re.search(r"articles-(\d+)", ruta.name)
         e = Enlace(
             anio=args.anio, seccion=args.seccion, periodo=args.periodo,
-            mes_cierre=mes_de_cierre(args.periodo), moneda=args.moneda,
+            mes=mes_de_cierre(args.periodo), moneda=args.moneda,
             documento="archivo local", article_id=int(m.group(1)) if m else 0,
             url=str(ruta), ts="local",
         )
@@ -554,6 +611,7 @@ def main(argv=None) -> int:
                 log.warning("   sin enlaces CSV en el HTML estatico de %s", pagina)
                 diagnosticar(html, anio, seccion, cache)
                 continue
+            informar_cobertura(enlaces)
             for e in enlaces:
                 try:
                     if db is not None and not args.forzar and ya_cargado(db, e):
